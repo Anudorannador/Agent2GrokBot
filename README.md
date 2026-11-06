@@ -4,7 +4,7 @@ An MCP server that lets any MCP client - Cursor Desktop, WorkBuddy or another
 client - delegate work to a fixed, webhook-only Grok Bot peer and receive the
 answer in the same tool call.
 
-An MCP client has no inbound listener, so a webhook reply has nowhere to land.
+Desktop agents have no inbound listener, so a webhook reply has nowhere to land.
 `Agent2GrokBot` sits on a real HTTP address and bridges the two halves: it holds
 one SSE stream open for the client while the peer reports progress and results
 by POSTing callbacks. When the HTTP deadline is reached, the call degrades to a
