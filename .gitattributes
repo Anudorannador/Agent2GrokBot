@@ -1,0 +1,11 @@
+# Keep the working tree and the index on LF on every platform.
+* text=auto eol=lf
+
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.whl binary
+*.gz binary

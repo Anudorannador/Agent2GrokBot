@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+agent2grokbot.db
+agent2grokbot.db-wal
+agent2grokbot.db-shm
+.a2g_token
+.env
