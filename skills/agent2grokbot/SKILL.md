@@ -1,6 +1,6 @@
 ---
 name: agent2grokbot
-description: Dispatch work to Grok Bot peers through the Agent2GrokBot MCP server. This skill should be used when an agent needs to choose a peer by capabilities, call task_send, register peers with peer_add or peer_update, or collect a long-running result with task_get. Defines the responsibility split between the human, the Bot, the MCP server and the calling agent. Not for Bot setup, which is a one-time human action.
+description: Dispatch work to Grok Bot peers through the Agent2GrokBot MCP server. This skill should be used when an agent needs to choose a peer by capabilities, call task_send, register peers with peer_add or peer_update, or collect a long-running result with task_get. Defines the responsibility split between the human, the Bot, the MCP server and the calling agent. Not for Bot setup or server deployment, which are already done when this skill is used.
 agent_created: true
 ---
 
@@ -8,36 +8,34 @@ agent_created: true
 
 ## Purpose
 
-Delegate work over the `agent2grokbot` MCP tools without confusing which part
-owns what. Wire-level details: [`references/tools.md`](references/tools.md).
+Tell the calling agent how to delegate work over the `agent2grokbot` MCP tools
+and which part owns what. The MCP connection and the Bot are already set up;
+this skill covers neither installation nor configuration.
 
 ## Coordination
 
 | Party | Owns | Does not do |
 | --- | --- | --- |
-| Human | Paste the setup prompt into the Bot chat once; register the webhook URL and sender key with `peer_add` | Dispatch tasks |
-| Grok Bot | Do the work in `prompt`; send signed heartbeat, progress and result callbacks | Accept inbound client connections |
-| Agent2GrokBot MCP server | Peer registry, lane allocation, one outbound webhook POST per task, callback auth and dedupe, liveness and stale detection, SSE stream and task handles | Run the work, configure the Bot, choose a peer, enforce capabilities |
-| Calling agent (this skill) | Discover peers, choose `peer_id` by `capabilities`, send `prompt`, poll a handle, cancel | Wake a background desktop client |
+| Human | One-time Bot setup and peer registration | Dispatch tasks |
+| Grok Bot | Do the work in `prompt`; report progress and a final result | Accept inbound client connections |
+| Agent2GrokBot MCP server | Peer registry, dispatch, lane allocation, liveness, SSE stream and task handles | Run the work, choose a peer, enforce capabilities |
+| Calling agent (this skill) | Discover peers, choose `peer_id`, send `prompt`, poll a handle, cancel | Configure the Bot or the server |
 
-`capabilities` is free text on each peer. The server never parses or enforces it;
-selection is always the caller's decision with an explicit `peer_id`.
+`capabilities` is free text on each peer. The server never parses or enforces
+it; selection is always the caller's decision with an explicit `peer_id`.
 
 ## Prerequisites
 
-- Server reachable; `GET /health` returns `{"ok": true}`.
-- MCP entry points at `POST /mcp`, carries `Authorization: Bearer <token>` when
-  `A2G_ADMIN_TOKEN` is set, and accepts JSON plus `text/event-stream`.
-- One enabled peer with a webhook lane whose Bot already has the standing
-  webhook behaviour. Without it, no callbacks arrive and tasks go `stale`.
+- The `agent2grokbot` MCP tools are connected; `peer_list()` succeeds.
+- At least one enabled peer exists whose Bot is initialized. Without the Bot's
+  callbacks, tasks go `stale`.
 - Never invent a `peer_id`; tool schemas contain no registry data.
 
 ## Workflow
 
 1. `peer_list()` -> read `id`, `capabilities`, `enabled`, `lanes[].busy_task_id`.
 2. Pick the enabled peer whose `capabilities` fits; otherwise ask the user.
-3. `task_send(peer_id, prompt)` with a self-contained prompt. Optional
-   `session_label`, `heartbeat_interval_s`.
+3. `task_send(peer_id, prompt)` with a self-contained prompt.
 4. `status: "completed"` -> use `result`. `status: "working"` -> poll
    `task_get(task_id)` until terminal; `task_cancel` to abandon.
 5. Only an explicit `result` completes a task; heartbeats and silence do not.
@@ -64,9 +62,8 @@ or secrets in `prompt`.
 
 - No auto-routing; `capabilities` is a label, not a policy.
 - Lanes are concurrency slots of one peer, not different specialists.
-- `A2G_SSE_MAX_S` (55s) degrades to a handle; the task keeps running.
+- A long call returns a handle; the task keeps running in the background.
 - Heartbeats are liveness only, never forwarded to the model.
-- Single process, in-memory subscriber queues, no history eviction.
 - Reads never return secrets; `peer_delete` refuses in-flight peers.
 
 ## Scenarios
