@@ -111,12 +111,14 @@ uv run agent2grokbot        # 127.0.0.1:7583
    from the request envelope or the legacy handshake, so both v2 and older
    clients get the right response shape.
 
-3. **Set up the Grok Bot.** Paste
-   [`grokbot/SETUP-PROMPT.md`](grokbot/SETUP-PROMPT.md) into the Bot chat once;
-   it installs the standing behaviour for all webhook tasks. That init prompt
-   defines the `X-A2G-*` headers, so re-paste it when migrating from an older
-   deployment. Copy the routine's webhook URL and sender key from the routine
-   panel, then register them:
+3. **Set up the Grok Bot.** Paste the prompt in
+   [`skills/agent2grokbot/references/bot-setup.md`](skills/agent2grokbot/references/bot-setup.md)
+   into the Bot chat once; it installs the standing behaviour for all webhook
+   tasks. That file is the single source of truth (the old
+   [`grokbot/SETUP-PROMPT.md`](grokbot/SETUP-PROMPT.md) now points to it).
+   The init prompt defines the `X-A2G-*` headers, so re-paste it when migrating
+   from an older deployment. Copy the routine's webhook URL and sender key from
+   the routine panel, then register them:
 
    ```
    peer_add(name="Grok main", peer_id="grok-main", url="<webhook URL>",
