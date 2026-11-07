@@ -329,11 +329,11 @@ sharing one peer.
 
 ## Client skill
 
-[`.workbuddy/skills/agent2grokbot-dispatch/`](.workbuddy/skills/agent2grokbot-dispatch/SKILL.md)
-is a project skill for MCP clients. It documents the discovery-first workflow,
-calling prerequisites, full parameter and return values, limitations and typical
-scenarios. Install the directory under `.workbuddy/skills/` in a WorkBuddy
-workspace, or read `SKILL.md` directly before delegating.
+[`skills/agent2grokbot/`](skills/agent2grokbot/SKILL.md) is a standard skill
+folder for any MCP client or coding agent. It documents the discovery-first
+workflow, calling prerequisites, full parameter and return values, limitations
+and typical scenarios. Copy or link the directory into an agent's skills path,
+or read `SKILL.md` directly before delegating.
 
 ## Limitations
 

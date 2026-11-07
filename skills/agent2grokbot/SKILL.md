@@ -1,16 +1,16 @@
 ---
-name: agent2grokbot-dispatch
+name: agent2grokbot
 description: Delegate work from an MCP client to webhook-only Grok Bot peers registered in Agent2GrokBot, and select the correct peer from its capabilities text. This skill should be used when dispatching with task_send, discovering or registering peers with peer_list, peer_get, peer_add, peer_update, or collecting a long-running answer with task_get, task_list and task_cancel. Covers endpoint and Bearer authentication prerequisites, task handles after the SSE deadline, callback liveness, and the limits of capability metadata. Not for configuring the Bot itself; that belongs to grokbot/SETUP-PROMPT.md.
 agent_created: true
 ---
 
-# Agent2GrokBot Dispatch
+# Agent2GrokBot
 
 ## Purpose
 
-Delegate work from any MCP client (Cursor Desktop, WorkBuddy, another client) to
-a registered Grok Bot peer through the `agent2grokbot` MCP server, and choose the
-peer by its `capabilities` description. The server holds one SSE stream open per
+Delegate work from any MCP client to a registered Grok Bot peer through the
+`agent2grokbot` MCP server, and choose the peer by its `capabilities`
+description. The server holds one SSE stream open per
 in-flight `tools/call` while the Bot POSTs signed callbacks; when the stream
 deadline expires, the call returns a task handle that `task_get` must poll. No
 result is lost at that boundary.
@@ -161,5 +161,5 @@ peer_update(peer_id="grok-research", capabilities="market research, earnings pre
 
 - [`references/tools.md`](references/tools.md) - full parameter, return value,
   status, authentication and callback reference.
-- [`grokbot/SETUP-PROMPT.md`](../../../grokbot/SETUP-PROMPT.md) - Bot-side
+- [`grokbot/SETUP-PROMPT.md`](../../grokbot/SETUP-PROMPT.md) - Bot-side
   standing behaviour, outside this skill's scope.
