@@ -1,6 +1,6 @@
 ---
 name: agent2grokbot
-description: Delegate work from an MCP client to webhook-only Grok Bot peers registered in Agent2GrokBot, and select the correct peer from its capabilities text. This skill should be used when dispatching with task_send, discovering or registering peers with peer_list, peer_get, peer_add, peer_update, or collecting a long-running answer with task_get, task_list and task_cancel. Covers endpoint and Bearer authentication prerequisites, task handles after the SSE deadline, callback liveness, and the limits of capability metadata. Not for configuring the Bot itself; that belongs to grokbot/SETUP-PROMPT.md.
+description: Delegate work from an MCP client to webhook-only Grok Bot peers registered in Agent2GrokBot, and select the correct peer from its capabilities text. This skill should be used when dispatching with task_send, discovering or registering peers with peer_list, peer_get, peer_add, peer_update, or collecting a long-running answer with task_get, task_list and task_cancel. Covers endpoint and Bearer authentication prerequisites, task handles after the SSE deadline, callback liveness, and the limits of capability metadata. Bot-side setup is bundled under references/; this skill is not for configuring the Bot itself.
 agent_created: true
 ---
 
@@ -25,7 +25,8 @@ result is lost at that boundary.
 - An in-flight task must be abandoned with `task_cancel`.
 
 Do not use this skill to configure the Bot's own behaviour. Its standing rules
-come from `grokbot/SETUP-PROMPT.md`, which is pasted into the Bot chat once.
+are documented in the bundled [`references/bot-setup.md`](references/bot-setup.md)
+and are pasted into the Bot chat once, during initial setup.
 
 ## Prerequisites
 
@@ -36,7 +37,8 @@ come from `grokbot/SETUP-PROMPT.md`, which is pasted into the Bot chat once.
    `Authorization: Bearer <token>`; the client must accept both
    `application/json` and `text/event-stream`.
 3. At least one enabled peer with a webhook lane is registered, and its Bot has
-   been initialized with `grokbot/SETUP-PROMPT.md`. Without the Bot-side
+   been initialized with the standing behaviour in
+   [`references/bot-setup.md`](references/bot-setup.md). Without the Bot-side
    heartbeat and `result` callbacks, every task eventually goes `stale`.
 4. The nine tools are available: `peer_add`, `peer_get`, `peer_list`,
    `peer_update`, `peer_delete`, `task_send`, `task_get`, `task_list`,
@@ -159,7 +161,12 @@ peer_update(peer_id="grok-research", capabilities="market research, earnings pre
 
 ## References
 
+All references are bundled inside this skill folder. Installing only
+`skills/agent2grokbot/` is sufficient; nothing depends on files elsewhere in
+the repository.
+
 - [`references/tools.md`](references/tools.md) - full parameter, return value,
   status, authentication and callback reference.
-- [`grokbot/SETUP-PROMPT.md`](../../grokbot/SETUP-PROMPT.md) - Bot-side
-  standing behaviour, outside this skill's scope.
+- [`references/bot-setup.md`](references/bot-setup.md) - the Bot-side standing
+  behaviour, callback shapes, signature scheme, heartbeat timing and security
+  rules, including the prompt to paste into the Bot chat once.
