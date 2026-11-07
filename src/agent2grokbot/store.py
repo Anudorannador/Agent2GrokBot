@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field, SQLModel, delete, select, update
@@ -61,6 +61,7 @@ class Peer(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     name: str
+    capabilities: str = ""
     enabled: bool = True
     created_at: str
     updated_at: str
@@ -202,10 +203,19 @@ class Store:
             connect_args={"timeout": 10},
         )
         async with self.engine.begin() as conn:
-            # ponytail: WAL/busy_timeout are driver pragmas; all table SQL is SQLModel.
+            # ponytail: pragmas and this one schema upgrade are the only raw SQL;
+            # every table definition and query goes through SQLModel.
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
             await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
             await conn.run_sync(SQLModel.metadata.create_all)
+            # create_all never alters an existing table, so databases written by
+            # an older release need the column added once, without losing peers.
+            columns = await conn.run_sync(
+                lambda sync_conn: {col["name"] for col in
+                                   inspect(sync_conn).get_columns("peers")})
+            if "capabilities" not in columns:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE peers ADD COLUMN capabilities VARCHAR NOT NULL DEFAULT ''")
         self.sessions = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False)
         if self.client is None:
@@ -302,7 +312,8 @@ class Store:
         return lid
 
     async def peer_add(self, name: str, url: str, secret: str,
-                       peer_id: str | None = None) -> str:
+                       peer_id: str | None = None,
+                       capabilities: str = "") -> str:
         if not name:
             raise ValueError("name is required")
         self.check_url(url)
@@ -310,8 +321,8 @@ class Store:
         ts = now()
         if await self.q(select(Peer).where(Peer.id == pid)):
             raise ValueError("peer id already exists")
-        await self.add(Peer(id=pid, name=name, enabled=True,
-                            created_at=ts, updated_at=ts))
+        await self.add(Peer(id=pid, name=name, capabilities=capabilities,
+                            enabled=True, created_at=ts, updated_at=ts))
         await self.lane_add(pid, url, secret)
         return pid
 
@@ -319,7 +330,8 @@ class Store:
         lanes = await self.q(select(PeerLane).where(
             PeerLane.peer_id == row.id).order_by(PeerLane.created_at))
         return {
-            "id": row.id, "name": row.name, "enabled": bool(row.enabled),
+            "id": row.id, "name": row.name, "capabilities": row.capabilities,
+            "enabled": bool(row.enabled),
             "created_at": row.created_at, "updated_at": row.updated_at,
             "lanes": [self._lane_public(lane) for lane in lanes],
         }
@@ -338,6 +350,9 @@ class Store:
         if "name" in patch:
             await self.x(update(Peer).where(Peer.id == peer_id).values(
                 name=patch["name"], updated_at=now()))
+        if "capabilities" in patch:
+            await self.x(update(Peer).where(Peer.id == peer_id).values(
+                capabilities=patch["capabilities"], updated_at=now()))
         if "enabled" in patch:
             await self.x(update(Peer).where(Peer.id == peer_id).values(
                 enabled=bool(patch["enabled"]), updated_at=now()))

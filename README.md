@@ -119,8 +119,14 @@ uv run agent2grokbot        # 127.0.0.1:7583
    panel, then register them:
 
    ```
-   peer_add(name="Grok main", peer_id="grok-main", url="<webhook URL>", secret="<sender key>")
+   peer_add(name="Grok main", peer_id="grok-main", url="<webhook URL>",
+            secret="<sender key>", capabilities="market research and summarization")
    ```
+
+   `capabilities` is free text describing what the Bot is for. It is metadata
+   for the caller, not a restriction enforced by the server; the Bot's actual
+   behaviour still comes from its setup prompt. Change it later with
+   `peer_update(peer_id="grok-main", capabilities="...")`.
 
 4. **Delegate.** The tool only runs when the agent is told to use it:
 
@@ -205,10 +211,19 @@ proxy idle timeouts, not a hard client deadline, which is why the handle exists.
 
 | Tool                                                                  | Purpose                                                                                              |
 | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `peer_add` / `peer_get` / `peer_list` / `peer_update` / `peer_delete` | Peer CRUD. Reads never return secrets, only a fingerprint. Delete refuses while tasks are in flight. |
-| `task_send`                                                           | Dispatch and stream the result in one call. Accepts `session_label` and `heartbeat_interval_s`.     |
-| `task_get` / `task_list`                                              | Read status and result, including after an SSE deadline.                                             |
-| `task_cancel`                                                         | Cancel, notify the peer, release the lane.                                                           |
+| `peer_add` / `peer_get` / `peer_list` / `peer_update` / `peer_delete` | Peer CRUD, including a free-text `capabilities` field. Reads never return secrets, only a fingerprint. Delete refuses while tasks are in flight. |
+| `task_send`                                                           | Dispatch and stream the result in one call. Accepts `session_label` and `heartbeat_interval_s`.                                                  |
+| `task_get` / `task_list`                                              | Read status and result, including after an SSE deadline.                                                                                       |
+| `task_cancel`                                                         | Cancel, notify the peer, release the lane.                                                                                                     |
+
+### Choosing a peer
+
+Tool schemas are static and contain no registry data, so call `peer_list` before
+dispatching. Each peer returns `id`, `name`, `capabilities`, `enabled` and its
+lanes. Select the `peer_id` whose `capabilities` fits the work and pass it
+explicitly to `task_send`; there is no capability-based auto-routing. Lanes are
+concurrency slots for one peer, not a list of specialists. `session_label`
+groups tasks for audit purposes and never affects routing.
 
 Tool schemas are generated from Python type hints by the SDK; `Context` is
 injected for progress reporting and is not exposed in the schema.
@@ -311,6 +326,14 @@ version errors, the legacy handshake, peer CRUD, lane allocation and queueing,
 callback auth and dedupe, adaptive heartbeats, stale detection, cancellation,
 SSE progress frames, deadline degradation, and three concurrent sessions
 sharing one peer.
+
+## Client skill
+
+[`.workbuddy/skills/agent2grokbot-dispatch/`](.workbuddy/skills/agent2grokbot-dispatch/SKILL.md)
+is a project skill for MCP clients. It documents the discovery-first workflow,
+calling prerequisites, full parameter and return values, limitations and typical
+scenarios. Install the directory under `.workbuddy/skills/` in a WorkBuddy
+workspace, or read `SKILL.md` directly before delegating.
 
 ## Limitations
 

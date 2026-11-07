@@ -47,16 +47,21 @@ def create_app(config: Config | None = None,
     cfg = config or Config()
     store = Store(cfg, http_client)
     mcp = MCPServer("agent2grokbot", version=__version__,
-                    instructions="Dispatch tasks to registered webhook peers.")
+                    instructions=(
+                        "Dispatch tasks to registered webhook peers. Call peer_list "
+                        "first and choose peer_id from each peer's capabilities; "
+                        "task_send requires an explicit peer_id."))
 
     # ------------------------------------------------------------------ tools
 
     @mcp.tool()
     async def peer_add(name: str, url: str, secret: str,
-                       peer_id: str | None = None) -> dict:
-        """Register a webhook peer. Returns the new peer id."""
+                       peer_id: str | None = None,
+                       capabilities: str | None = None) -> dict:
+        """Register a webhook peer with a free-text capabilities description. Returns the new peer id."""
         try:
-            return {"peer_id": await store.peer_add(name, url, secret, peer_id)}
+            return {"peer_id": await store.peer_add(name, url, secret, peer_id,
+                                                     capabilities or "")}
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
 
@@ -73,13 +78,16 @@ def create_app(config: Config | None = None,
 
     @mcp.tool()
     async def peer_update(peer_id: str, name: str | None = None,
+                          capabilities: str | None = None,
                           enabled: bool | None = None,
                           add_lanes: list[dict] | None = None,
                           remove_lanes: list[str] | None = None) -> dict:
-        """Update a peer's name, enabled flag, or webhook lanes."""
+        """Update a peer's name, capabilities, enabled flag, or webhook lanes."""
         patch: dict[str, Any] = {}
         if name is not None:
             patch["name"] = name
+        if capabilities is not None:
+            patch["capabilities"] = capabilities
         if enabled is not None:
             patch["enabled"] = enabled
         if add_lanes:

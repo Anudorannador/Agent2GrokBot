@@ -34,6 +34,28 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("prompt", schema)
             self.assertIn("heartbeat_interval_s", schema)
             self.assertNotIn("ctx", schema, "Context is injected, not advertised")
+            for name in ("peer_add", "peer_update"):
+                self.assertIn("capabilities",
+                              tools[name]["inputSchema"]["properties"])
+
+    async def test_capabilities_are_writable_and_discoverable_over_mcp(self):
+        text = "just for testing, ask anything and following your way"
+        async with support.Harness() as h:
+            _, added = await h.call_tool("peer_add", {
+                "name": "Grok", "url": "http://127.0.0.1:9/hook",
+                "secret": h.bot_key, "peer_id": "grokbot",
+                "capabilities": text})
+            self.assertEqual(support.result_json(added)["peer_id"], "grokbot")
+
+            _, listed = await h.call_tool("peer_list")
+            payload = support.result_json(listed)
+            peers = payload if isinstance(payload, list) else [payload]
+            self.assertEqual(peers[0]["capabilities"], text)
+
+            _, updated = await h.call_tool("peer_update", {
+                "peer_id": "grokbot", "capabilities": "market research only"})
+            self.assertEqual(support.result_json(updated)["capabilities"],
+                             "market research only")
 
     async def test_tools_call_is_complete(self):
         async with support.Harness() as h:

@@ -1,12 +1,15 @@
 """Async state, security, lane allocation and callback lifecycle."""
 
 import json
+import os
+import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
 from sqlmodel import select, update
 
-from agent2grokbot.store import (MAX_HEARTBEAT_S, PeerLane, Task,
+from agent2grokbot.store import (MAX_HEARTBEAT_S, Config, PeerLane, Store, Task,
                                  next_heartbeat_interval, now, sign, verify)
 
 from . import support
@@ -53,6 +56,44 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len((await store.peer_get(pid))["lanes"]), 1)
             self.assertTrue(await store.peer_delete(pid))
             self.assertEqual(await store.peer_list(), [])
+
+    async def test_capabilities_round_trip_and_default(self):
+        async with self.harness() as h:
+            store = h.store
+            text = "just for testing, ask anything and following your way"
+            pid = await store.peer_add("Grok", "http://127.0.0.1:9/hook", "k",
+                                       "grokbot", text)
+            self.assertEqual((await store.peer_get(pid))["capabilities"], text)
+            self.assertEqual((await store.peer_list())[0]["capabilities"], text)
+            updated = await store.peer_update(pid, {
+                "capabilities": "market research only"})
+            self.assertEqual(updated["capabilities"], "market research only")
+            plain = await store.peer_add("Plain", "http://127.0.0.1:9/hook", "k")
+            self.assertEqual((await store.peer_get(plain))["capabilities"], "")
+
+    async def test_legacy_database_gains_capabilities_column(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="a2g-legacy-"), "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE peers (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+            "enabled BOOLEAN NOT NULL, created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO peers VALUES ('grokbot', 'Grok', 1, 't', 't')")
+        conn.commit()
+        conn.close()
+
+        store = Store(Config(db=path))
+        await store.open()
+        try:
+            peer = await store.peer_get("grokbot")
+            self.assertEqual(peer["name"], "Grok")
+            self.assertEqual(peer["capabilities"], "")
+            self.assertTrue(await store.peer_update("grokbot", {
+                "capabilities": "just for testing, ask anything and following your way"}))
+            self.assertEqual((await store.peer_get("grokbot"))["capabilities"],
+                             "just for testing, ask anything and following your way")
+        finally:
+            await store.close()
 
     async def test_peer_delete_refuses_in_flight(self):
         async with self.harness() as h:
