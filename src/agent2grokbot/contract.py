@@ -117,11 +117,13 @@ CONTRACT: tuple[Change, ...] = (
 
 
 def _key(version: str) -> tuple[int, ...]:
-    """Order versions numerically so 0.10.0 sorts after 0.9.0."""
+    """Order versions numerically so 0.10.0 sorts after 0.9.0, and 1.0 == 1.0.0."""
     parts = []
     for piece in str(version).strip().lstrip("vV").split("."):
         digits = "".join(ch for ch in piece if ch.isdigit())
         parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
     return tuple(parts)
 
 

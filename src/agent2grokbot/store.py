@@ -344,21 +344,23 @@ class Store:
                 raise ValueError("private webhook host is not allowed")
         return url
 
+    def _ticket(self, *parts) -> str:
+        """HMAC over dot-joined parts; one implementation for every signed URL."""
+        message = ".".join(str(part) for part in parts)
+        return hmac.new(self.config.master_secret.encode(), message.encode(),
+                        hashlib.sha256).hexdigest()
+
     def callback_token(self, task_id: str) -> str:
-        return hmac.new(self.config.master_secret.encode(), task_id.encode(),
-                        hashlib.sha256).hexdigest()[:32]
+        return self._ticket(task_id)[:32]
 
     # --------------------------------------------------------------- contracts
 
     def contract_ack_url(self, peer_id: str) -> str:
         """Peer-scoped ack link; the ticket is signed and expires like a blob URL."""
         expires = int(time.time()) + max(300, self.config.blob_url_ttl_s)
-        ticket = hmac.new(
-            self.config.master_secret.encode(),
-            ("%s.%d" % (peer_id, expires)).encode(),
-            hashlib.sha256).hexdigest()
         query = urllib.parse.urlencode({
-            "peer_id": peer_id, "expires": expires, "ticket": ticket})
+            "peer_id": peer_id, "expires": expires,
+            "ticket": self._ticket(peer_id, expires)})
         return "%s/v1/contract/ack?%s" % (self.config.public_base, query)
 
     def contract_payload(self, peer: Peer | None) -> dict:
@@ -389,22 +391,22 @@ class Store:
             return 400, {"error": "invalid expires"}
         if expiry < time.time():
             return 401, {"error": "ack link expired"}
-        expected = hmac.new(
-            self.config.master_secret.encode(),
-            ("%s.%s" % (peer_id, expires)).encode(),
-            hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, ticket or ""):
+        if not hmac.compare_digest(self._ticket(peer_id, expires), ticket or ""):
             return 401, {"error": "bad ticket"}
         rows = await self.q(select(Peer).where(Peer.id == peer_id))
         if not rows:
             return 404, {"error": "unknown peer"}
         claimed = version or contract.current_version()
-        await self.x(update(Peer).where(Peer.id == peer_id).values(
-            protocol_version=claimed, contract_seen_at=now()))
+        # Same rule as a heartbeat echo: an ack only ever moves a peer forward.
+        effective = rows[0].protocol_version
+        if contract.is_newer(claimed, effective):
+            await self.x(update(Peer).where(Peer.id == peer_id).values(
+                protocol_version=claimed, contract_seen_at=now()))
+            effective = claimed
         return 200, {"accepted": True, "peer_id": peer_id,
-                     "protocol_version": claimed,
+                     "protocol_version": effective,
                      "current_version": contract.current_version(),
-                     "up_to_date": not contract.is_behind(claimed)}
+                     "up_to_date": not contract.is_behind(effective)}
 
     async def contract_broadcast(self, peer_ids: list[str] | None = None,
                                  dry_run: bool = False) -> dict:
@@ -417,6 +419,10 @@ class Store:
         for peer in peers:
             lanes = await self.q(select(PeerLane).where(
                 PeerLane.peer_id == peer.id).order_by(PeerLane.created_at).limit(1))
+            if not lanes:
+                results.append({"peer_id": peer.id, "sent": False,
+                                "error": "peer has no webhook lanes"})
+                continue
             payload = {
                 "event": "contract.updated",
                 "peer_id": peer.id,
@@ -424,10 +430,6 @@ class Store:
                 "contract": self.contract_payload(peer),
                 "instructions": CONTRACT_INSTRUCTIONS,
             }
-            if not lanes:
-                results.append({"peer_id": peer.id, "sent": False,
-                                "error": "peer has no webhook lanes"})
-                continue
             if dry_run:
                 results.append({"peer_id": peer.id, "sent": False,
                                 "would_send": payload})
@@ -565,11 +567,9 @@ class Store:
 
     def blob_url(self, blob_id: str, task_id: str) -> str:
         expires = int(time.time()) + max(60, self.config.blob_url_ttl_s)
-        message = "%s.%s.%d" % (blob_id, task_id, expires)
-        ticket = hmac.new(self.config.master_secret.encode(), message.encode(),
-                          hashlib.sha256).hexdigest()
         query = urllib.parse.urlencode({
-            "task_id": task_id, "expires": expires, "ticket": ticket})
+            "task_id": task_id, "expires": expires,
+            "ticket": self._ticket(blob_id, task_id, expires)})
         return "%s/v1/blobs/%s?%s" % (self.config.public_base, blob_id, query)
 
     def blob_descriptor(self, row: Blob, with_url: bool = True) -> dict:
@@ -641,10 +641,8 @@ class Store:
             return None
         if expiry < time.time():
             return None
-        message = "%s.%s.%d" % (blob_id, task_id, expiry)
-        expected = hmac.new(self.config.master_secret.encode(), message.encode(),
-                            hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, ticket or ""):
+        if not hmac.compare_digest(
+                self._ticket(blob_id, task_id, expiry), ticket or ""):
             return None
         row = await self.blob_row(blob_id)
         if not row or row.task_id != task_id:

@@ -147,6 +147,27 @@ class ContractFlowTest(unittest.IsolatedAsyncioTestCase):
                 "ticket": "0" * 64})
             self.assertEqual(response.status_code, 401)
 
+    async def test_ack_never_rewinds_a_newer_record(self):
+        async with support.Harness() as h:
+            peer_id = await h.add_peer()
+            await h.store.record_protocol(peer_id, contract.current_version())
+            ack_url = h.store.contract_ack_url(peer_id)
+            parsed = urllib.parse.urlparse(ack_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            response = await h.client.post(parsed.path, params={
+                "peer_id": peer_id, "expires": query["expires"][0],
+                "ticket": query["ticket"][0]},
+                content=json.dumps({"protocol_version": "0.3.0"}))
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["protocol_version"],
+                             contract.current_version())
+            self.assertTrue(response.json()["up_to_date"])
+
+    async def test_version_keys_treat_padding_as_equal(self):
+        # "0.5" and "0.5.0" are the same release, so neither outranks the other.
+        self.assertFalse(contract.is_newer("0.5.0", "0.5"))
+        self.assertFalse(contract.is_newer("0.5", "0.5.0"))
+
     async def test_broadcast_dry_run_sends_nothing(self):
         async with support.Harness() as h:
             await h.add_peer()
