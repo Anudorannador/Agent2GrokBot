@@ -8,6 +8,8 @@ FastAPI, registers tools and handles the peer's inbound callbacks.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -15,14 +17,27 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from mcp.server.mcpserver import MCPServer
+from mcp.types import CallToolResult, ResourceLink, TextContent
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
-from .store import Config, Store
+from .store import BlobTooLarge, Config, Store, verify
+
+
+def tool_response(payload: dict) -> CallToolResult:
+    """Keep the JSON summary first, then expose attachments as MCP resource links."""
+    content = [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+    result = payload.get("result")
+    if isinstance(result, dict):
+        for item in result.get("attachments", []):
+            content.append(ResourceLink(
+                type="resource_link", name=item["name"], uri=item["url"],
+                mimeType=item["mime_type"], size=item["size"]))
+    return CallToolResult(content=content, structuredContent=payload)
 
 
 class AdminTokenMiddleware:
@@ -33,7 +48,9 @@ class AdminTokenMiddleware:
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if self.token and scope["type"] == "http" and scope["path"].startswith("/mcp"):
+        guarded = scope["type"] == "http" and (
+            scope["path"].startswith("/mcp") or scope["path"] == "/v1/blobs")
+        if self.token and guarded:
             headers = dict(scope["headers"])
             if headers.get(b"authorization") != ("Bearer " + self.token).encode():
                 await JSONResponse({"error": "unauthorized"}, status_code=401)(
@@ -110,11 +127,12 @@ def create_app(config: Config | None = None,
     @mcp.tool()
     async def task_send(peer_id: str, prompt: str, ctx: Context,
                         session_label: str | None = None,
-                        heartbeat_interval_s: int | None = None) -> dict:
-        """Dispatch a task to a peer and stream its result. Returns a task handle if the deadline is reached."""
+                        heartbeat_interval_s: int | None = None,
+                        attachment_ids: list[str] | None = None) -> dict:
+        """Dispatch a task with optional uploaded blob IDs. Returns a task handle if the deadline is reached."""
         try:
             tid, _ = await store.task_create(peer_id, prompt, session_label,
-                                             heartbeat_interval_s)
+                                             heartbeat_interval_s, attachment_ids)
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
         mailbox = store.subscribe(tid)
@@ -124,7 +142,7 @@ def create_app(config: Config | None = None,
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return await store.handle(tid)
+                    return tool_response(await store.handle(tid))
                 try:
                     event = await asyncio.wait_for(mailbox.get(),
                                                    timeout=min(0.5, remaining))
@@ -139,14 +157,16 @@ def create_app(config: Config | None = None,
                     continue
                 if event.get("is_error"):
                     raise ToolError(str(event.get("error") or kind))
-                return {"task_id": tid, "status": kind, "result": event.get("result")}
+                return tool_response(
+                    {"task_id": tid, "status": kind, "result": event.get("result")})
         finally:
             store.unsubscribe(tid, mailbox)
 
     @mcp.tool()
     async def task_get(task_id: str) -> dict:
-        """Read the current status and result of a task."""
-        return await store.task_get(task_id) or {"error": "unknown task"}
+        """Read status and result, including fresh signed URLs for output attachments."""
+        return tool_response(
+            await store.task_get(task_id) or {"error": "unknown task"})
 
     @mcp.tool()
     async def task_list(peer_id: str | None = None,
@@ -163,9 +183,11 @@ def create_app(config: Config | None = None,
 
     parsed = urllib.parse.urlparse(cfg.public_base)
     host = parsed.hostname or "127.0.0.1"
+    extra_hosts = [item.strip() for item in cfg.allowed_hosts.split(",") if item.strip()]
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "%s:*" % host],
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "%s:*" % host,
+                       *extra_hosts],
         allowed_origins=["http://127.0.0.1:*", "http://localhost:*",
                          "http://[::1]:*", "%s://%s:*" % (parsed.scheme, host)],
     )
@@ -191,9 +213,71 @@ def create_app(config: Config | None = None,
     async def health() -> dict:
         return await store.stats()
 
+    @app.post("/v1/blobs")
+    async def blob_upload(request: Request, filename: str | None = None):
+        """Upload an agent input as raw bytes; bind the returned ID with task_send."""
+        length = request.headers.get("content-length")
+        try:
+            too_large = length is not None and int(length) > cfg.blob_max_bytes
+        except ValueError:
+            return JSONResponse({"error": "invalid Content-Length"}, status_code=400)
+        if too_large:
+            return JSONResponse({"error": "blob too large"}, status_code=413)
+        try:
+            value = await store.blob_save(
+                request.stream(), filename, request.headers.get("content-type"))
+        except BlobTooLarge as exc:
+            return JSONResponse({"error": str(exc)}, status_code=413)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(value, status_code=201)
+
+    @app.post("/v1/tasks/{task_id}/blobs")
+    async def blob_peer_upload(task_id: str, request: Request,
+                               filename: str | None = None):
+        """Stream a Grok Bot output without buffering or signing the whole file."""
+        task = await store.task_row(task_id)
+        if not task:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        token = task.callback_token
+        if not hmac.compare_digest(
+                headers.get("authorization", ""), "Bearer " + token):
+            return JSONResponse({"error": "bad callback token"}, status_code=401)
+        expected = headers.get("x-a2g-sha256", "")
+        signed = ("%s.%s" % (task_id, expected)).encode()
+        if not verify(token, signed, headers.get("x-a2g-signature")):
+            return JSONResponse({"error": "bad signature"}, status_code=401)
+        length = headers.get("content-length")
+        try:
+            too_large = length is not None and int(length) > cfg.blob_max_bytes
+        except ValueError:
+            return JSONResponse({"error": "invalid Content-Length"}, status_code=400)
+        if too_large:
+            return JSONResponse({"error": "blob too large"}, status_code=413)
+        try:
+            value = await store.blob_save(
+                request.stream(), filename, headers.get("content-type"),
+                task_id=task_id, direction="output", expected_sha256=expected)
+        except BlobTooLarge as exc:
+            return JSONResponse({"error": str(exc)}, status_code=413)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(value, status_code=201)
+
+    @app.get("/v1/blobs/{blob_id}")
+    async def blob_download(blob_id: str, task_id: str, expires: str, ticket: str):
+        value = await store.blob_download(blob_id, task_id, expires, ticket)
+        if not value:
+            return JSONResponse({"error": "blob not found or URL expired"}, status_code=404)
+        row, path = value
+        return FileResponse(path, media_type=row.mime_type, filename=row.name)
+
     @app.post("/cb/{task_id}")
     async def callback(task_id: str, request: Request) -> JSONResponse:
         raw = await request.body()
+        if len(raw) > cfg.webhook_max_bytes:
+            return JSONResponse({"error": "callback metadata too large"}, status_code=413)
         code, payload = await store.callback(task_id, dict(request.headers), raw)
         return JSONResponse(status_code=code, content=payload)
 

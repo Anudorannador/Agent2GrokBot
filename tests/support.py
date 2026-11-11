@@ -61,7 +61,7 @@ class Harness:
 
     def __init__(self, *, mode="ok", work=0.25, heartbeat=0.05, sse_max_s=5,
                  miss_threshold=2, heartbeat_interval_s=1, admin_token="",
-                 bot_key="bot-key"):
+                 allowed_hosts="", bot_key="bot-key"):
         self.mode = mode
         self.work = work
         self.heartbeat = heartbeat
@@ -73,6 +73,7 @@ class Harness:
             db=os.path.join(tempfile.mkdtemp(prefix="a2g-"), "test.db"),
             public_base=BASE,
             admin_token=admin_token,
+            allowed_hosts=allowed_hosts,
             master_secret="test-master-secret",
             heartbeat_interval_s=heartbeat_interval_s,
             miss_threshold=miss_threshold,

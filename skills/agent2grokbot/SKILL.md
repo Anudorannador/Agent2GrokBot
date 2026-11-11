@@ -35,10 +35,15 @@ it; selection is always the caller's decision with an explicit `peer_id`.
 
 1. `peer_list()` -> read `id`, `capabilities`, `enabled`, `lanes[].busy_task_id`.
 2. Pick the enabled peer whose `capabilities` fits; otherwise ask the user.
-3. `task_send(peer_id, prompt)` with a self-contained prompt.
-4. `status: "completed"` -> use `result`. `status: "working"` -> poll
-   `task_get(task_id)` until terminal; `task_cancel` to abandon.
-5. Only an explicit `result` completes a task; heartbeats and silence do not.
+3. For files, first upload raw bytes to `POST /v1/blobs?filename=<name>` with the
+   configured admin Bearer token and file MIME `Content-Type`; then pass the
+   returned IDs as `task_send(..., attachment_ids=[...])`. Never Base64 files into
+   `prompt`. Download result attachments from their signed `url` values.
+4. `task_send(peer_id, prompt)` with a self-contained prompt.
+5. `status: "completed"` -> use `result`; output files also appear as MCP
+   `resource_link` content blocks. `status: "working"` -> poll `task_get(task_id)`
+   until terminal; `task_cancel` to abandon. `task_get` refreshes download URLs.
+6. Only an explicit `result` completes a task; heartbeats and silence do not.
 
 ## Parameters and returns
 
@@ -49,8 +54,8 @@ it; selection is always the caller's decision with an explicit `peer_id`.
 | `peer_add` | `name`, `url`, `secret` | `peer_id`, `capabilities` | `{"peer_id": ...}` |
 | `peer_update` | `peer_id` | `name`, `capabilities`, `enabled`, `add_lanes`, `remove_lanes` | Updated peer |
 | `peer_delete` | `peer_id` | - | `{"deleted": bool}` |
-| `task_send` | `peer_id`, `prompt` | `session_label`, `heartbeat_interval_s` | `completed` result or `working` handle |
-| `task_get` | `task_id` | - | Task with `status`, `result`, `error` |
+| `task_send` | `peer_id`, `prompt` | `session_label`, `heartbeat_interval_s`, `attachment_ids` | `completed` result or `working` handle; output resource links |
+| `task_get` | `task_id` | - | Task with `status`, `result`, `error`; fresh attachment URLs |
 | `task_list` | - | `peer_id`, `status` | Task objects |
 | `task_cancel` | `task_id` | - | `{"ok": bool, "message": ...}` |
 
@@ -65,10 +70,15 @@ or secrets in `prompt`.
 - A long call returns a handle; the task keeps running in the background.
 - Heartbeats are liveness only, never forwarded to the model.
 - Reads never return secrets; `peer_delete` refuses in-flight peers.
+- Blob URLs expire; call `task_get` for fresh output URLs. Input IDs can be bound
+  only once, and output IDs must belong to the same task.
+- Binary storage is not automatically evicted; do not treat it as permanent storage.
 
 ## Scenarios
 
 - Current `grokbot` peer (`just for testing, ask anything and following your way`): `peer_list()` -> `task_send(peer_id="grokbot", prompt="...")` -> poll if `working`.
+- Send audio/video: upload each file to `/v1/blobs` -> `task_send(...,
+  attachment_ids=[...])` -> follow result `resource_link` URLs.
 - Two specialists: choose by `capabilities`, dispatch to that `id`.
 - Register one: `peer_add(..., capabilities="...")`; refine with `peer_update`.
 - Withdraw a request: `task_cancel(task_id)`, then stop polling.

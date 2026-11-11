@@ -33,6 +33,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("peer_id", schema)
             self.assertIn("prompt", schema)
             self.assertIn("heartbeat_interval_s", schema)
+            self.assertIn("attachment_ids", schema)
             self.assertNotIn("ctx", schema, "Context is injected, not advertised")
             for name in ("peer_add", "peer_update"):
                 self.assertIn("capabilities",
@@ -110,6 +111,13 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             response = await h.client.get("/health")
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.json()["ok"])
+
+    async def test_extra_allowed_host_for_tailscale(self):
+        h = support.Harness(allowed_hosts="100.77.227.21:*")
+        async with h:
+            response = await h.rpc("tools/list", {"_meta": support.META},
+                                  extra_headers={"Host": "100.77.227.21:7583"})
+            self.assertEqual(response.status_code, 200)
 
     async def test_admin_token_guard(self):
         async with support.Harness(admin_token="test-admin") as h:

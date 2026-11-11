@@ -8,7 +8,9 @@ Desktop agents have no inbound listener, so a webhook reply has nowhere to land.
 `Agent2GrokBot` sits on a real HTTP address and bridges the two halves: it holds
 one SSE stream open for the client while the peer reports progress and results
 by POSTing callbacks. When the HTTP deadline is reached, the call degrades to a
-task handle that `task_get` can poll; the result is never lost.
+task handle that `task_get` can poll; the result is never lost. Binary inputs and
+outputs use a streaming blob API: webhook JSON carries signed attachment references,
+never Base64 file contents, and MCP results include `resource_link` content blocks.
 
 Stack: Python 3.13, uv, FastAPI, the official `mcp` SDK (MCP 2.0 / 2026-07-28),
 SQLModel over SQLite with aiosqlite. Versions are pinned in `pyproject.toml` and
@@ -162,8 +164,10 @@ cannot be renegotiated.
 ### Server to peer (POST only)
 
 The server sends one `task.created` POST containing `task_id`, `prompt`,
-`callback` (URL, token, headers), `heartbeat_interval_s`, and `instructions`.
-The peer returns `2xx` immediately and works in the background.
+`callback` (URL, token, headers), `attachments`, `blob_upload`,
+`heartbeat_interval_s`, and `instructions`. Attachment entries contain metadata
+and an expiring signed download URL; `blob_upload` is the task-scoped output
+endpoint. The peer returns `2xx` immediately and works in the background.
 
 Every callback goes to `POST /cb/{task_id}` with:
 
@@ -175,6 +179,60 @@ Every callback goes to `POST /cb/{task_id}` with:
 Only an explicit `result` completes a task; silence is never completion. A
 background sweeper marks a task `stale` after `A2G_MISS_THRESHOLD` times the
 current liveness interval without a callback.
+
+### Binary attachments
+
+Files never travel inside webhook JSON or the SQLite database. The default layout
+is `agent2grokbot.db` beside `blobs/`; `A2G_BLOB_DIR` can override the directory.
+Uploads stream to a temporary file, verify size and SHA-256, then atomically move
+to `blobs/<blob_id>`. SQLite stores only metadata and task ownership.
+
+**Agent input.** Upload raw bytes with the admin Bearer token when configured:
+
+```bash
+curl -sS -X POST "$A2G_BASE/v1/blobs?filename=meeting.mp3" \
+  -H "Authorization: Bearer $A2G_ADMIN_TOKEN" \
+  -H "Content-Type: audio/mpeg" --data-binary @meeting.mp3
+```
+
+The `201` response is `{blob_id,name,mime_type,size,sha256}`. Bind one or more
+IDs when dispatching; an unbound input can be attached only once:
+
+```text
+task_send(peer_id="grok-main", prompt="Transcribe the recording",
+          attachment_ids=["b-..."])
+```
+
+`task.created.attachments[]` adds `url` and `expires_in_s`. Grok Bot downloads
+each URL with HTTP GET. URLs are task-scoped HMAC tickets and expire after
+`A2G_BLOB_URL_TTL_S`; they are not permanent public links.
+
+**Grok Bot output.** Compute the file's SHA-256 hex digest and sign the UTF-8
+bytes `<task_id>.<sha256>` with the callback token and the normal
+`X-A2G-Signature` timestamp scheme. POST the raw bytes to `blob_upload.url` with:
+
+- `Authorization: Bearer <callback_token>`
+- `X-A2G-SHA256: <hex>` and the signature described above
+- `Content-Type: <file MIME type>` and `?filename=<name>`
+
+This signs the digest rather than the full body, so large uploads remain
+streamed. The server verifies the digest after writing. Then complete the task
+with attachment IDs only:
+
+```json
+{"type":"result","task_id":"t-01","event_id":"t-01-r",
+ "result":{"text":"Transcription complete",
+           "attachments":[{"blob_id":"b-..."}]}}
+```
+
+The server accepts an output ID only if that same task uploaded it. MCP
+`task_send` and `task_get` responses keep the JSON summary as their first text
+block and append one MCP `resource_link` per file. `task_get` generates fresh
+signed URLs. Arbitrary remote URLs are never fetched by the server.
+
+`A2G_WEBHOOK_MAX_BYTES` limits outbound and inbound JSON metadata, not blob
+bytes. `A2G_BLOB_MAX_BYTES` and `A2G_MAX_ATTACHMENTS` limit binary size and
+attachment count.
 
 ### Adaptive heartbeat timing
 
@@ -212,7 +270,7 @@ proxy idle timeouts, not a hard client deadline, which is why the handle exists.
 | Tool                                                                  | Purpose                                                                                              |
 | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `peer_add` / `peer_get` / `peer_list` / `peer_update` / `peer_delete` | Peer CRUD, including a free-text `capabilities` field. Reads never return secrets, only a fingerprint. Delete refuses while tasks are in flight. |
-| `task_send`                                                           | Dispatch and stream the result in one call. Accepts `session_label` and `heartbeat_interval_s`.                                                  |
+| `task_send`                                                           | Dispatch and stream the result in one call. Accepts `session_label`, `heartbeat_interval_s` and uploaded input `attachment_ids`; output files are MCP resource links. |
 | `task_get` / `task_list`                                              | Read status and result, including after an SSE deadline.                                                                                       |
 | `task_cancel`                                                         | Cancel, notify the peer, release the lane.                                                                                                     |
 
@@ -235,10 +293,16 @@ injected for progress reporting and is not exposed in the schema.
 | `A2G_DB`                   | `agent2grokbot.db`        | SQLite file (WAL)                                       |
 | `A2G_PUBLIC_BASE_URL`      | `http://127.0.0.1:7583`   | Base for callback URLs and the allowed Host             |
 | `A2G_ADMIN_TOKEN`          | empty                     | Bearer token required on `/mcp` when set                |
+| `A2G_ALLOWED_HOSTS`        | empty                     | Additional comma-separated MCP Host patterns, e.g. `100.x.y.z:*` |
 | `A2G_MASTER_SECRET`        | `agent2grokbot-local-dev` | HMAC key for per-task callback tokens                   |
 | `A2G_HEARTBEAT_INTERVAL_S` | `300`                     | Initial interval; the peer may override it per callback |
 | `A2G_MISS_THRESHOLD`       | `2`                       | Missed current intervals before `stale`                 |
 | `A2G_SSE_MAX_S`            | `55`                      | Deadline before degrading to a task handle              |
+| `A2G_BLOB_DIR`             | `blobs/` beside `A2G_DB`  | Binary storage directory                                |
+| `A2G_BLOB_MAX_BYTES`       | `104857600`               | Maximum bytes per uploaded file (100 MiB)               |
+| `A2G_BLOB_URL_TTL_S`       | `3600`                    | Signed download URL lifetime; minimum effective is 60   |
+| `A2G_MAX_ATTACHMENTS`      | `20`                      | Maximum input or output references per task             |
+| `A2G_WEBHOOK_MAX_BYTES`    | `262144`                  | Maximum webhook/callback JSON metadata size (256 KiB)   |
 | `A2G_ALLOW_PRIVATE_URLS`   | `1`                       | Set to `0` to block private webhook hosts (SSRF guard)  |
 
 The `300s` interval and `2` misses match the five-minute floor of Grok Bot
@@ -253,9 +317,12 @@ Callbacks after a terminal state get `410`.
 ## Deployment and authentication
 
 A remote MCP client and a public-internet Grok Bot both need a front end.
-`A2G_PUBLIC_BASE_URL` must be that front end's URL: it builds `callback.url`
-for the Bot **and** adds its Host to the SDK's DNS-rebinding allowlist. There is
-exactly one extra allowed Host, so all clients must use the same hostname.
+`A2G_PUBLIC_BASE_URL` must be that front end's URL: it builds `callback.url`,
+attachment download URLs and `blob_upload.url` for the Bot **and** adds its Host
+to the SDK's DNS-rebinding allowlist. The public base remains the single generated
+callback/download host, but MCP clients may connect through additional interfaces
+listed in `A2G_ALLOWED_HOSTS`. For example, `A2G_ALLOWED_HOSTS=100.77.227.21:*`
+allows a Tailscale IP without changing the URLs sent to Grok Bot.
 
 ### Cloudflare Tunnel
 
@@ -273,8 +340,9 @@ For a stable hostname, use a named tunnel with an ingress rule pointing
 `a2g.example.com` at `http://127.0.0.1:7583`, then set
 `A2G_PUBLIC_BASE_URL=https://a2g.example.com`. Cloudflare Access can sit in
 front: give the client a service token via `CF-Access-Client-Id` and
-`CF-Access-Client-Secret` headers, and add a bypass policy for `/cb/*`, or the
-Grok Bot cannot POST its callbacks.
+`CF-Access-Client-Secret` headers, and add bypass policies for `/cb/*`, `/v1/blobs/*` and `/v1/tasks/*/blobs`, or
+the Grok Bot cannot call back, download inputs or upload outputs. Keep the agent
+upload route `POST /v1/blobs` behind Access or the admin token.
 
 ### Tailscale
 
@@ -300,6 +368,9 @@ no built-in authentication at all.
 | -------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `POST /mcp` (client)             | `Bearer <A2G_ADMIN_TOKEN>`                   | Only when the env var is set. No OAuth, no mTLS, no per-user identity.                             |
 | `GET /health`                    | none                                         | Counts only, no secrets.                                                                            |
+| `POST /v1/blobs` (agent)         | `Bearer <A2G_ADMIN_TOKEN>`                   | Same optional admin guard as `/mcp`; raw request body, streamed to disk.                           |
+| `GET /v1/blobs/{id}`             | task-scoped signed URL                       | HMAC ticket and expiry in the query string; no admin or callback token in the URL.                 |
+| `POST /v1/tasks/{id}/blobs`      | callback token + digest-bound HMAC signature | Grok Bot output upload; SHA-256 is verified after streaming.                                       |
 | `POST /cb/{task_id}` (Grok Bot)  | `Bearer <callback_token>` + HMAC signature   | Per-task token, 300s replay window, `event_id` dedupe, `410` after terminal. Not the admin token.  |
 | `POST <webhook>` (Server to Bot) | `Bearer <lane secret>` + HMAC signature      | Lane secret registered by `peer_add`.                                                              |
 
@@ -344,13 +415,14 @@ or read `SKILL.md` directly before delegating.
 - **SSE keepalive defeats idle timeouts, not hard client deadlines.** The SDK
   pings every 15 seconds; `A2G_SSE_MAX_S` is a deployment value, and exceeding
   it degrades to `task_get` polling.
-- **Single public host.** One extra DNS-rebinding Host, so a private tailnet
-  hostname for the client and a separate public tunnel for callbacks cannot be
-  mixed without changing the allowlist in `app.py`.
+- **Single generated public base.** Callback and blob URLs use
+  `A2G_PUBLIC_BASE_URL`; additional MCP client Host patterns in
+  `A2G_ALLOWED_HOSTS` do not change URL generation.
 - **Single process.** Subscriber queues live in memory. A multi-replica
   deployment needs pub/sub so a callback can reach the instance holding the SSE
   stream.
-- **No message eviction.** `agent2grokbot.db` grows indefinitely.
+- **No message or blob eviction.** `agent2grokbot.db` and `blobs/` grow indefinitely;
+  set an external retention policy appropriate for the stored content.
 - **Peer liveness is threshold-based.** Only a refused connection at dispatch is
   detected instantly; a peer that dies mid-task is detected after missed
   heartbeats.
