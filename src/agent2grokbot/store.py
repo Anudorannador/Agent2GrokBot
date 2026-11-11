@@ -31,6 +31,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field, SQLModel, delete, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from . import contract
+
 INSTRUCTIONS = (
     "Send heartbeats to callback.url from the work loop between milestones. "
     "heartbeat_interval_s is advisory: if you use ScheduleRoutine for a scheduled "
@@ -59,6 +61,14 @@ CANCEL_INSTRUCTIONS = (
     "Stop the work, stop heartbeats and delete the ScheduleRoutine for this "
     "task_id, and do not POST further heartbeats or results for it."
 )
+CONTRACT_INSTRUCTIONS = (
+    "This is not a task. It announces that the Agent2GrokBot wire contract moved "
+    "to contract.current_version. Apply contract.prompt_patch to your own standing "
+    "instructions, replacing any earlier text it supersedes, then acknowledge by "
+    "POSTing {\"protocol_version\": \"<contract.current_version>\"} to "
+    "contract.ack_url. Echo protocol_version in every future heartbeat and result "
+    "callback. Nothing here changes callback.url or reveals any secret."
+)
 TERMINAL = ("completed", "failed", "stale", "cancelled")
 IN_FLIGHT = ("queued", "dispatched", "running")
 MAX_HEARTBEAT_S = 86400
@@ -73,6 +83,10 @@ class Peer(SQLModel, table=True):
     enabled: bool = True
     created_at: str
     updated_at: str
+    # ponytail: the newest contract version this peer has acknowledged. NULL means
+    # the peer predates version reporting, so every delta is still owed to it.
+    protocol_version: Optional[str] = None
+    contract_seen_at: Optional[str] = None
 
 
 class PeerLane(SQLModel, table=True):
@@ -255,6 +269,10 @@ class Store:
             if "capabilities" not in columns:
                 await conn.exec_driver_sql(
                     "ALTER TABLE peers ADD COLUMN capabilities VARCHAR NOT NULL DEFAULT ''")
+            for column in ("protocol_version", "contract_seen_at"):
+                if column not in columns:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE peers ADD COLUMN %s VARCHAR" % column)
         self.sessions = async_sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False)
         if self.client is None:
@@ -330,6 +348,109 @@ class Store:
         return hmac.new(self.config.master_secret.encode(), task_id.encode(),
                         hashlib.sha256).hexdigest()[:32]
 
+    # --------------------------------------------------------------- contracts
+
+    def contract_ack_url(self, peer_id: str) -> str:
+        """Peer-scoped ack link; the ticket is signed and expires like a blob URL."""
+        expires = int(time.time()) + max(300, self.config.blob_url_ttl_s)
+        ticket = hmac.new(
+            self.config.master_secret.encode(),
+            ("%s.%d" % (peer_id, expires)).encode(),
+            hashlib.sha256).hexdigest()
+        query = urllib.parse.urlencode({
+            "peer_id": peer_id, "expires": expires, "ticket": ticket})
+        return "%s/v1/contract/ack?%s" % (self.config.public_base, query)
+
+    def contract_payload(self, peer: Peer | None) -> dict:
+        """The delta a specific peer still owes, with its own ack link."""
+        value = contract.delta(peer.protocol_version if peer else None)
+        value["peer_id"] = peer.id if peer else None
+        value["ack_url"] = self.contract_ack_url(peer.id) if peer else None
+        return value
+
+    async def record_protocol(self, peer_id: str, version: str | None) -> bool:
+        """Advance a peer's recorded version; never rewinds on a stale echo."""
+        if not version or not isinstance(version, str):
+            return False
+        rows = await self.q(select(Peer).where(Peer.id == peer_id))
+        if not rows:
+            return False
+        if not contract.is_newer(version, rows[0].protocol_version):
+            return False
+        await self.x(update(Peer).where(Peer.id == peer_id).values(
+            protocol_version=version, contract_seen_at=now()))
+        return True
+
+    async def contract_ack(self, peer_id: str, expires: str, ticket: str,
+                           version: str | None) -> tuple[int, dict]:
+        try:
+            expiry = int(expires)
+        except (TypeError, ValueError):
+            return 400, {"error": "invalid expires"}
+        if expiry < time.time():
+            return 401, {"error": "ack link expired"}
+        expected = hmac.new(
+            self.config.master_secret.encode(),
+            ("%s.%s" % (peer_id, expires)).encode(),
+            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, ticket or ""):
+            return 401, {"error": "bad ticket"}
+        rows = await self.q(select(Peer).where(Peer.id == peer_id))
+        if not rows:
+            return 404, {"error": "unknown peer"}
+        claimed = version or contract.current_version()
+        await self.x(update(Peer).where(Peer.id == peer_id).values(
+            protocol_version=claimed, contract_seen_at=now()))
+        return 200, {"accepted": True, "peer_id": peer_id,
+                     "protocol_version": claimed,
+                     "current_version": contract.current_version(),
+                     "up_to_date": not contract.is_behind(claimed)}
+
+    async def contract_broadcast(self, peer_ids: list[str] | None = None,
+                                 dry_run: bool = False) -> dict:
+        """Push `contract.updated` to each peer so its standing prompt can migrate."""
+        stmt = select(Peer).where(Peer.enabled == True)  # noqa: E712
+        if peer_ids:
+            stmt = stmt.where(Peer.id.in_(peer_ids))
+        peers = await self.q(stmt.order_by(Peer.created_at))
+        results = []
+        for peer in peers:
+            lanes = await self.q(select(PeerLane).where(
+                PeerLane.peer_id == peer.id).order_by(PeerLane.created_at).limit(1))
+            payload = {
+                "event": "contract.updated",
+                "peer_id": peer.id,
+                "protocol_version": contract.current_version(),
+                "contract": self.contract_payload(peer),
+                "instructions": CONTRACT_INSTRUCTIONS,
+            }
+            if not lanes:
+                results.append({"peer_id": peer.id, "sent": False,
+                                "error": "peer has no webhook lanes"})
+                continue
+            if dry_run:
+                results.append({"peer_id": peer.id, "sent": False,
+                                "would_send": payload})
+                continue
+            ok, err = await self._post(lanes[0], payload, None)
+            results.append({"peer_id": peer.id, "sent": ok, "error": err or None})
+        return {"dry_run": dry_run, "current_version": contract.current_version(),
+                "peers": results}
+
+    async def contract_status(self) -> dict:
+        peers = await self.q(select(Peer).order_by(Peer.created_at))
+        return {
+            "current_version": contract.current_version(),
+            "peers": [{
+                "peer_id": row.id, "name": row.name, "enabled": bool(row.enabled),
+                "protocol_version": row.protocol_version,
+                "contract_seen_at": row.contract_seen_at,
+                "up_to_date": not contract.is_behind(row.protocol_version),
+                "pending_versions": [item.version for item in
+                                     contract.since(row.protocol_version)],
+            } for row in peers],
+        }
+
     # ------------------------------------------------------------------ peers
 
     @staticmethod
@@ -372,6 +493,10 @@ class Store:
             "id": row.id, "name": row.name, "capabilities": row.capabilities,
             "enabled": bool(row.enabled),
             "created_at": row.created_at, "updated_at": row.updated_at,
+            "protocol_version": row.protocol_version,
+            "contract_seen_at": row.contract_seen_at,
+            "contract_current": contract.current_version(),
+            "contract_uptodate": not contract.is_behind(row.protocol_version),
             "lanes": [self._lane_public(lane) for lane in lanes],
         }
 
@@ -683,18 +808,23 @@ class Store:
             self._spawn(self.dispatch_queued(row.peer_id))
         return True
 
-    async def _post(self, lane: PeerLane, payload: dict, task_id: str) -> tuple[bool, str]:
+    async def _post(self, lane: PeerLane, payload: dict,
+                    task_id: str | None) -> tuple[bool, str]:
         raw = json.dumps(payload, ensure_ascii=False).encode()
         if len(raw) > self.config.webhook_max_bytes:
             return False, "webhook metadata exceeds %d bytes" % self.config.webhook_max_bytes
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + lane.secret,
+            "X-A2G-Signature": sign(lane.secret, raw),
+            "X-A2G-Delivery": uuid.uuid4().hex,
+        }
+        # ponytail: contract.updated is peer-scoped, not task-scoped, so the
+        # task header is absent rather than a fake task id.
+        if task_id:
+            headers["X-A2G-Task-Id"] = task_id
         try:
-            response = await self.client.post(lane.url, content=raw, headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + lane.secret,
-                "X-A2G-Signature": sign(lane.secret, raw),
-                "X-A2G-Delivery": uuid.uuid4().hex,
-                "X-A2G-Task-Id": task_id,
-            })
+            response = await self.client.post(lane.url, content=raw, headers=headers)
             if not 200 <= response.status_code < 300:
                 return False, "webhook returned HTTP %d" % response.status_code
             return True, ""
@@ -724,8 +854,11 @@ class Store:
                 token = task.callback_token
                 inputs = await self.q(select(Blob).where(
                     Blob.task_id == tid, Blob.direction == "input"))
+                peers = await self.q(select(Peer).where(Peer.id == task.peer_id))
+                peer = peers[0] if peers else None
                 payload = {
                     "event": "task.created", "task_id": tid, "prompt": task.prompt,
+                    "protocol_version": contract.current_version(),
                     "attachments": [self.blob_descriptor(row) for row in inputs],
                     "callback": {
                         "url": "%s/cb/%s" % (self.config.public_base, tid),
@@ -740,6 +873,11 @@ class Store:
                     "heartbeat_interval_s": task.heartbeat_interval_s,
                     "instructions": INSTRUCTIONS,
                 }
+                # Only while this peer is behind: the delta plus the prompt patch.
+                # A bot that echoes protocol_version stops receiving it, which keeps
+                # the webhook small for correctly migrated peers.
+                if contract.is_behind(peer.protocol_version if peer else None):
+                    payload["contract"] = self.contract_payload(peer)
                 ok, err = await self._post(lane, payload, tid)
                 if ok:
                     await self.x(update(Task).where(Task.task_id == tid).values(
@@ -766,6 +904,9 @@ class Store:
             return 400, {"error": "invalid JSON"}
         if body.get("task_id") != task_id:
             return 400, {"error": "task_id mismatch"}
+        # Silent migration signal: any callback may advertise the peer's version,
+        # and it only ever moves forward.
+        await self.record_protocol(row.peer_id, body.get("protocol_version"))
         kind = body.get("type")
         if kind not in ("heartbeat", "progress", "result", "failed"):
             return 400, {"error": "unknown callback type"}
@@ -847,6 +988,7 @@ class Store:
     async def stats(self) -> dict:
         return {
             "ok": True,
+            "protocol_version": contract.current_version(),
             "peers": await self.count(Peer),
             "lanes": await self.count(PeerLane),
             "tasks": await self.count(Task),

@@ -28,7 +28,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             tools = {t["name"]: t for t in result["tools"]}
             self.assertEqual(set(tools), {
                 "peer_add", "peer_get", "peer_list", "peer_update", "peer_delete",
-                "task_send", "task_get", "task_list", "task_cancel"})
+                "task_send", "task_get", "task_list", "task_cancel",
+                "contract_get", "contract_status", "contract_broadcast"})
             schema = tools["task_send"]["inputSchema"]["properties"]
             self.assertIn("peer_id", schema)
             self.assertIn("prompt", schema)
@@ -113,10 +114,10 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response.json()["ok"])
 
     async def test_extra_allowed_host_for_tailscale(self):
-        h = support.Harness(allowed_hosts="100.77.227.21:*")
+        h = support.Harness(allowed_hosts="100.64.0.9:*")
         async with h:
             response = await h.rpc("tools/list", {"_meta": support.META},
-                                  extra_headers={"Host": "100.77.227.21:7583"})
+                                  extra_headers={"Host": "100.64.0.9:7583"})
             self.assertEqual(response.status_code, 200)
 
     async def test_admin_token_guard(self):

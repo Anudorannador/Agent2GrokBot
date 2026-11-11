@@ -164,10 +164,16 @@ cannot be renegotiated.
 ### Server to peer (POST only)
 
 The server sends one `task.created` POST containing `task_id`, `prompt`,
-`callback` (URL, token, headers), `attachments`, `blob_upload`,
-`heartbeat_interval_s`, and `instructions`. Attachment entries contain metadata
-and an expiring signed download URL; `blob_upload` is the task-scoped output
-endpoint. The peer returns `2xx` immediately and works in the background.
+`protocol_version`, `callback` (URL, token, headers), `attachments`,
+`blob_upload`, `heartbeat_interval_s`, and `instructions`. Attachment entries
+contain metadata and an expiring signed download URL; `blob_upload` is the
+task-scoped output endpoint. A `contract` block appears only while that peer is
+behind the current wire contract. The peer returns `2xx` immediately and works
+in the background.
+
+Two other POST events reach a peer: `task.cancel`, which stops work for one
+`task_id`, and `contract.updated`, which is peer-scoped, carries no
+`X-A2G-Task-Id`, and asks the Bot to migrate its own standing prompt.
 
 Every callback goes to `POST /cb/{task_id}` with:
 
@@ -234,6 +240,49 @@ signed URLs. Arbitrary remote URLs are never fetched by the server.
 bytes. `A2G_BLOB_MAX_BYTES` and `A2G_MAX_ATTACHMENTS` limit binary size and
 attachment count.
 
+### Contract channel
+
+The wire contract is versioned in `src/agent2grokbot/contract.py`. That file is
+the single source of truth for what a Bot must know, and it exists so an
+upgraded server does not require re-pasting the setup prompt into every Bot.
+
+Each released version records `added`, `changed`, `removed` and `prompt_patch`,
+where `prompt_patch` is the exact text a Bot folds into its own standing
+instructions. Entries are append-only: a mistake is corrected by the next
+version, never by editing history.
+
+Three mechanisms carry a change to a Bot:
+
+1. **Every `task.created` carries `protocol_version`.** When the target peer has
+   not yet acknowledged that version, the payload also carries a `contract`
+   block with `your_version`, `changes[]`, the concatenated `prompt_patch` and a
+   peer-scoped `ack_url`. A migrated peer gets no block, so the webhook stays
+   small.
+2. **`contract.updated` is a push-only event** sent by `contract_broadcast`, for
+   Bots that must migrate while no task is in flight. It is peer-scoped, so it
+   carries no `X-A2G-Task-Id` header.
+3. **A Bot acks** by echoing `protocol_version` in any heartbeat or result
+   callback, or by POSTing `{"protocol_version": "..."}` to the `ack_url` from
+   the broadcast. Version records only move forward, so a late duplicate cannot
+   rewind a peer.
+
+`POST /v1/contract/ack?peer_id=&expires=&ticket=` is authenticated by a
+peer-scoped HMAC ticket, not the admin token, so a Bot can ack without holding
+a server secret.
+
+Operator workflow after a protocol change:
+
+```text
+1. append a Change entry with the new prompt_patch   (contract.py)
+2. contract_get(version="<previous>")               # review the delta
+3. contract_broadcast(dry_run=true)                 # inspect the payload
+4. contract_broadcast()                             # push to every enabled peer
+5. contract_status()                                # see who has acked
+```
+
+`contract_status` is the adapter dashboard: each peer reports its recorded
+`protocol_version`, `up_to_date`, and the `pending_versions` it still owes.
+
 ### Adaptive heartbeat timing
 
 The peer owns its timer. A batch data-fix step can run far longer than the
@@ -273,6 +322,9 @@ proxy idle timeouts, not a hard client deadline, which is why the handle exists.
 | `task_send`                                                           | Dispatch and stream the result in one call. Accepts `session_label`, `heartbeat_interval_s` and uploaded input `attachment_ids`; output files are MCP resource links. |
 | `task_get` / `task_list`                                              | Read status and result, including after an SSE deadline.                                                                                       |
 | `task_cancel`                                                         | Cancel, notify the peer, release the lane.                                                                                                     |
+| `contract_get`                                                        | Read the wire contract. With `version`, returns only the deltas that peer still owes plus the `prompt_patch`; `full=true` returns every release. |
+| `contract_status`                                                     | Per-peer migration dashboard: recorded `protocol_version`, `up_to_date`, `pending_versions`.                                                   |
+| `contract_broadcast`                                                  | Push `contract.updated` to all enabled peers, or one `peer_id`. `dry_run=true` returns the payload without sending.                            |
 
 ### Choosing a peer
 
@@ -321,7 +373,7 @@ A remote MCP client and a public-internet Grok Bot both need a front end.
 attachment download URLs and `blob_upload.url` for the Bot **and** adds its Host
 to the SDK's DNS-rebinding allowlist. The public base remains the single generated
 callback/download host, but MCP clients may connect through additional interfaces
-listed in `A2G_ALLOWED_HOSTS`. For example, `A2G_ALLOWED_HOSTS=100.77.227.21:*`
+listed in `A2G_ALLOWED_HOSTS`. For example, `A2G_ALLOWED_HOSTS=100.x.y.z:*`
 allows a Tailscale IP without changing the URLs sent to Grok Bot.
 
 ### Cloudflare Tunnel
@@ -372,6 +424,7 @@ no built-in authentication at all.
 | `GET /v1/blobs/{id}`             | task-scoped signed URL                       | HMAC ticket and expiry in the query string; no admin or callback token in the URL.                 |
 | `POST /v1/tasks/{id}/blobs`      | callback token + digest-bound HMAC signature | Grok Bot output upload; SHA-256 is verified after streaming.                                       |
 | `POST /cb/{task_id}` (Grok Bot)  | `Bearer <callback_token>` + HMAC signature   | Per-task token, 300s replay window, `event_id` dedupe, `410` after terminal. Not the admin token.  |
+| `POST /v1/contract/ack` (Grok Bot) | peer-scoped signed ticket                  | Contract acknowledgement; no server secret required by the Bot. Ticket is HMAC-bound to `peer_id` and expires. |
 | `POST <webhook>` (Server to Bot) | `Bearer <lane secret>` + HMAC signature      | Lane secret registered by `peer_add`.                                                              |
 
 `AdminTokenMiddleware` is pure ASGI and guards only `/mcp`, so it never buffers
@@ -405,6 +458,92 @@ folder for any MCP client or coding agent. It documents the discovery-first
 workflow, calling prerequisites, full parameter and return values, limitations
 and typical scenarios. Copy or link the directory into an agent's skills path,
 or read `SKILL.md` directly before delegating.
+
+## Field notes
+
+Failures observed in real deployments, and what each one actually means. Most
+"the Bot is broken" reports in this project turned out to be one of the first
+three.
+
+### Every task goes `stale` and the Bot never calls back
+
+Check what URL the Bot was told to use before touching the Bot:
+
+```bash
+curl -sS "$A2G_BASE/health"
+grep A2G_PUBLIC_BASE_URL /etc/agent2grokbot.env
+```
+
+If `A2G_PUBLIC_BASE_URL` is a LAN address (`192.168.x.x`), loopback, or a
+`100.x.y.z` Tailscale address, a cloud-hosted Bot can open the webhook but
+cannot reach `/cb/{task_id}`, `/v1/blobs/*`, or `/v1/tasks/*/blobs`. The
+symptom is identical whether the Bot failed or the network did, so verify from
+outside the network first:
+
+```bash
+curl -sS "https://<public-base>/health"
+```
+
+A `200` from an external host proves the ingress; anything else means the Bot
+was never at fault. Outbound delivery working while callbacks fail is the
+signature of this bug, because the two directions use different networks.
+
+### The wake runs but nothing arrives
+
+The webhook endpoint accepting a delivery (`200` with a `runUuid`) only means
+the run was queued. It says nothing about the callback network path. Distinguish
+the two by posting a no-op payload with the same credentials and reading the
+response body; `{"success":true,"runUuid":...}` confirms delivery acceptance,
+not reachability.
+
+Also compare `last_seen_at` across tasks. A lane whose last activity is days old
+means no task has moved through that peer since then, which rules out "it worked
+before the upgrade".
+
+### Funnel is refused
+
+`tailscale funnel` needs both HTTPS certificates and the `funnel` node
+attribute. The failure modes are distinct:
+
+```text
+500 ... your Tailscale account does not support getting TLS certs   → enable HTTPS Certificates
+Funnel is not enabled on your tailnet                              → approve the funnel link
+No serve config                                                    → the command never completed
+```
+
+`socket "funnel"` has hanging behaviour when either gate is closed, so run the
+command under `timeout` and check `tailscale funnel status` afterwards rather
+than assuming a silent hang means success.
+
+### Two supervisors fight over the port
+
+`systemd-run --user` creates a **transient** unit: it does not survive a reboot,
+`Restart=on-failure` misses clean exits, and secrets passed with `--setenv` show
+up in `systemctl cat`. If a persistent unit also exists, the second one
+crash-loops on `address already in use`:
+
+```text
+ERROR: [Errno 98] error while attempting to bind on address ('0.0.0.0', 7583)
+```
+
+Check `systemctl show -p NRestarts` on the persistent unit. Keep exactly one
+supervisor, keep the environment in a mode-`0600` `EnvironmentFile`, and verify
+with `kill -9 $(systemctl show -p MainPID --value <unit>)` that the process
+comes back with a new PID.
+
+### A restart silently breaks callbacks
+
+An ephemeral tunnel hostname changes on every restart. If `A2G_PUBLIC_BASE_URL`
+points at a quick tunnel, callbacks break the moment the tunnel is recreated,
+with no error anywhere except tasks going `stale` again. Use a stable hostname,
+or treat the tunnel URL as configuration that must be re-read after restarting
+it.
+
+### Version skew after an upgrade
+
+Before debugging a Bot against new behaviour, run `contract_status`. A peer with
+`up_to_date: false` is running an older contract and is behaving exactly as its
+version specifies; push `contract_broadcast` before concluding anything else.
 
 ## Limitations
 

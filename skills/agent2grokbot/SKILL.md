@@ -58,6 +58,9 @@ it; selection is always the caller's decision with an explicit `peer_id`.
 | `task_get` | `task_id` | - | Task with `status`, `result`, `error`; fresh attachment URLs |
 | `task_list` | - | `peer_id`, `status` | Task objects |
 | `task_cancel` | `task_id` | - | `{"ok": bool, "message": ...}` |
+| `contract_get` | - | `version`, `full` | Delta a peer on `version` still owes, or every release when `full` |
+| `contract_status` | - | - | Per-peer `protocol_version`, `up_to_date`, `pending_versions` |
+| `contract_broadcast` | - | `peer_id`, `dry_run` | Per-peer delivery result |
 
 A handle is `{"status":"working","task_id":...,"pollIntervalMs":15000,"hint":...}`.
 Terminal statuses: `completed`, `failed`, `stale`, `cancelled`. Never put tokens
@@ -82,3 +85,7 @@ or secrets in `prompt`.
 - Two specialists: choose by `capabilities`, dispatch to that `id`.
 - Register one: `peer_add(..., capabilities="...")`; refine with `peer_update`.
 - Withdraw a request: `task_cancel(task_id)`, then stop polling.
+- The server was upgraded: `contract_status()` first. `up_to_date: false` means
+  that peer is still on old behaviour, so `contract_broadcast(peer_id=...)`
+  before debugging a task against the new semantics. Never ask the user to
+  re-paste the Bot prompt; the push event replaces it.

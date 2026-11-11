@@ -67,6 +67,8 @@ class Harness:
         self.heartbeat = heartbeat
         self.bot_key = bot_key
         self.received: list[dict] = []
+        self.received_headers: list[dict] = []
+        self.contracts: list[dict] = []
         self.cancelled: list[str] = []
         self._pending: set[asyncio.Task] = set()
         self.config = Config(
@@ -93,6 +95,10 @@ class Harness:
         if request.headers.get("Authorization") != "Bearer " + self.bot_key:
             return httpx.Response(401, json={"error": "bad key"})
         self.received.append(body)
+        self.received_headers.append(dict(request.headers))
+        if body.get("event") == "contract.updated":
+            self.contracts.append(body)
+            return httpx.Response(200, json={"accepted": True})
         if body.get("event") == "task.cancel":
             self.cancelled.append(body.get("task_id"))
             return httpx.Response(200, json={"accepted": True})

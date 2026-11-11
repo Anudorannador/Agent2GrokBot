@@ -25,6 +25,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
+from . import contract
 from .store import BlobTooLarge, Config, Store, verify
 
 
@@ -179,6 +180,33 @@ def create_app(config: Config | None = None,
         """Cancel a task, tell the peer to delete its ScheduleRoutine, release the lane."""
         return await store.task_cancel(task_id)
 
+    # -------------------------------------------------------------- contracts
+
+    @mcp.tool()
+    async def contract_get(version: str | None = None,
+                           full: bool = False) -> dict:
+        """Read the wire contract. With `version`, returns only the deltas a peer on that version still owes, plus the exact prompt text to apply. `full` returns every released version."""
+        if full:
+            return {"current_version": contract.current_version(),
+                    "history": contract.history()}
+        value = contract.delta(version)
+        value["note"] = (
+            "Empty changes means this peer is current. Send `prompt_patch` to the "
+            "Bot, or call contract_broadcast to push it automatically.")
+        return value
+
+    @mcp.tool()
+    async def contract_status() -> dict:
+        """Show which peers have acknowledged the current contract version and which still owe a migration."""
+        return await store.contract_status()
+
+    @mcp.tool()
+    async def contract_broadcast(peer_id: str | None = None,
+                                 dry_run: bool = False) -> dict:
+        """Push a `contract.updated` webhook to peers (all enabled peers when peer_id is omitted) so each Bot migrates its own standing prompt. Use dry_run to inspect the payload first."""
+        return await store.contract_broadcast([peer_id] if peer_id else None,
+                                              dry_run)
+
     # --------------------------------------------------------------- transport
 
     parsed = urllib.parse.urlparse(cfg.public_base)
@@ -211,7 +239,7 @@ def create_app(config: Config | None = None,
 
     @app.get("/health")
     async def health() -> dict:
-        return await store.stats()
+        return {**await store.stats(), "version": __version__}
 
     @app.post("/v1/blobs")
     async def blob_upload(request: Request, filename: str | None = None):
@@ -272,6 +300,20 @@ def create_app(config: Config | None = None,
             return JSONResponse({"error": "blob not found or URL expired"}, status_code=404)
         row, path = value
         return FileResponse(path, media_type=row.mime_type, filename=row.name)
+
+    @app.post("/v1/contract/ack")
+    async def contract_ack(peer_id: str, expires: str, ticket: str,
+                           request: Request):
+        """A peer confirms it absorbed the current contract; authenticated by ticket."""
+        raw = await request.body()
+        version = None
+        if raw:
+            try:
+                version = json.loads(raw).get("protocol_version")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        code, payload = await store.contract_ack(peer_id, expires, ticket, version)
+        return JSONResponse(status_code=code, content=payload)
 
     @app.post("/cb/{task_id}")
     async def callback(task_id: str, request: Request) -> JSONResponse:
